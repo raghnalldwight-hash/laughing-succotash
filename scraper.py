@@ -1,12 +1,9 @@
-"""Scrape the Harry Potter Wiki (harrypotter.fandom.com) to build a word list.
+"""Fetch Harry Potter Wiki category members via the MediaWiki API.
  
 Usage:
-    python scraper.py                  # scrapes all categories, saves words.json
+    python scraper.py                  # fetches all categories, saves words.json
     python scraper.py --output my.json # custom output path
- 
-The script follows pagination inside each category so it collects *all*
-article titles, not just the first page.  A short polite delay is inserted
-between requests.
+    python scraper.py --merge          # add to existing words.json instead of replacing
  
 Output format (words.json):
     {
@@ -24,89 +21,83 @@ import time
 from typing import Optional
  
 import requests
-from bs4 import BeautifulSoup
  
  
-BASE_URL = "https://harrypotter.fandom.com"
+API_URL = "https://harrypotter.fandom.com/api.php"
  
-# Category paths to scrape.  Keys become category labels in words.json.
+# Map label -> MediaWiki category title.
 CATEGORIES: dict[str, str] = {
-    "characters": "/wiki/Category:Characters",
-    "spells": "/wiki/Category:Spells",
-    "potions": "/wiki/Category:Potions",
-    "plants": "/wiki/Category:Plants",
-    "creatures": "/wiki/Category:Magical_creatures",
+    "characters": "Category:Characters",
+    "spells": "Category:Spells",
+    "potions": "Category:Potions",
+    "plants": "Category:Plants",
+    "creatures": "Category:Magical_creatures",
 }
  
 HEADERS = {
+    # A real browser UA avoids generic bot blocks on the API endpoint too.
     "User-Agent": (
-        "HP-Anagram-Solver/1.0 "
-        "(https://github.com/raghnalldwight-hash/laughing-succotash)"
-    )
+        "Mozilla/5.0 (compatible; HP-Anagram-Solver/1.0; "
+        "+https://github.com/raghnalldwight-hash/laughing-succotash)"
+    ),
+    "Accept": "application/json",
 }
  
-REQUEST_DELAY = 0.75  # seconds between page requests
+REQUEST_DELAY = 0.5  # seconds between paginated API calls
+ 
+def fetch_category(category_title: str, label: str) -> list[str]:
+    """Return all page titles in *category_title* via the MediaWiki API.
  
  
-def get_page(url: str, retries: int = 3) -> Optional[BeautifulSoup]:
-    """Fetch *url* and return a parsed BeautifulSoup, or None on failure."""
-    for attempt in range(1, retries + 1):
-        try:
-            response = requests.get(url, headers=HEADERS, timeout=15)
-            response.raise_for_status()
-            return BeautifulSoup(response.text, "lxml")
-        except requests.RequestException as exc:
-            print(f"  [attempt {attempt}/{retries}] Error fetching {url}: {exc}")
-            if attempt < retries:
-                time.sleep(2 ** attempt)
-    return None
- 
- 
-def _next_page_url(soup: BeautifulSoup) -> Optional[str]:
-    """Return the absolute URL of the next category page, or None."""
-    # Fandom uses both a link element and a plain <a> with class
-    # 'category-page__pagination-next'.
-    link = soup.select_one("a.category-page__pagination-next")
-    if link and link.get("href"):
-        href = link["href"]
-        return href if href.startswith("http") else BASE_URL + href
-    return None
- 
- 
-def scrape_category(category_path: str, label: str) -> list[str]:
-    """Collect all article titles from one wiki category, following pages."""
+    The API returns up to 500 results per call; we follow `cmcontinue`
+    tokens until all pages have been retrieved.
+    """
     titles: list[str] = []
-    url: Optional[str] = BASE_URL + category_path
+    params: dict = {
+        "action": "query",
+        "list": "categorymembers",
+        "cmtitle": category_title,
+        "cmtype": "page",       # articles only — no subcategories or files
+        "cmlimit": "500",       # maximum allowed without bot rights
+        "format": "json",
+        "formatversion": "2",
+    }
     page_num = 1
  
-    while url:
-        print(f"  [{label}] page {page_num}: {url}")
-        soup = get_page(url)
-        if soup is None:
-            print(f"  [{label}] failed to load page, stopping.")
+    while True:
+        print(f"  [{label}] page {page_num} …")
+        try:
+            response = requests.get(
+                API_URL, params=params, headers=HEADERS, timeout=15
+            )
+            response.raise_for_status()
+            data = response.json()
+        except requests.RequestException as exc:
+            print(f"  [{label}] request failed: {exc}")
+            break
+        except json.JSONDecodeError as exc:
+            print(f"  [{label}] bad JSON: {exc}")
+            break
+        for member in data.get("query", {}).get("categorymembers", []):
+            titles.append(member["title"])
+ 
+        # The API signals more pages via a top-level "continue" block.
+        if "continue" not in data:
             break
  
-        # Article titles are in <a class="category-page__member-link">
-        for link in soup.select("a.category-page__member-link"):
-            title = link.get_text(strip=True)
-            # Skip sub-category entries (they start with "Category:")
-            if title and not title.startswith("Category:"):
-                titles.append(title)
- 
-        url = _next_page_url(soup)
+        params["cmcontinue"] = data["continue"]["cmcontinue"]
         page_num += 1
-        if url:
-            time.sleep(REQUEST_DELAY)
+        time.sleep(REQUEST_DELAY)
  
     return titles
  
  
-def scrape_all(categories: dict[str, str] = CATEGORIES) -> dict[str, list[str]]:
-    """Scrape every category and return a {label: [title, ...]} mapping."""
+def fetch_all(categories: dict[str, str] = CATEGORIES) -> dict[str, list[str]]:
+    """Fetch every category and return a {label: [title, ...]} mapping."""
     result: dict[str, list[str]] = {}
-    for label, path in categories.items():
-        print(f"\nScraping category: {label}")
-        titles = scrape_category(path, label)
+    for label, category_title in categories.items():
+        print(f"\nFetching category: {label} ({category_title})")
+        titles = fetch_category(category_title, label)
         result[label] = titles
         print(f"  → {len(titles)} entries collected.")
         time.sleep(REQUEST_DELAY)
@@ -114,22 +105,22 @@ def scrape_all(categories: dict[str, str] = CATEGORIES) -> dict[str, list[str]]:
  
  
 def merge_with_existing(
-    scraped: dict[str, list[str]],
+    fetched: dict[str, list[str]],
     existing_file: str,
 ) -> dict[str, list[str]]:
-    """Merge scraped titles with an existing words.json, deduplicating per category."""
+    """Merge fetched titles with an existing words.json, deduplicating per category."""
     try:
         with open(existing_file, "r", encoding="utf-8") as fh:
             existing: dict[str, list[str]] = json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError):
-        return scraped
- 
+        return fetched
+    
     merged: dict[str, list[str]] = {}
-    all_keys = set(existing) | set(scraped)
+    all_keys = set(existing) | set(fetched)
     for key in all_keys:
         seen: set[str] = set()
         combined: list[str] = []
-        for title in existing.get(key, []) + scraped.get(key, []):
+        for title in existing.get(key, []) + fetched.get(key, []):
             if title not in seen:
                 seen.add(title)
                 combined.append(title)
@@ -145,7 +136,9 @@ def save(data: dict[str, list[str]], output_file: str) -> None:
  
  
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Scrape the Harry Potter Wiki.")
+    parser = argparse.ArgumentParser(
+        description="Fetch Harry Potter Wiki categories via the MediaWiki API."
+    )
     parser.add_argument(
         "--output",
         default="words.json",
@@ -158,12 +151,9 @@ def main() -> None:
     )
     args = parser.parse_args()
  
-    scraped = scrape_all()
+    fetched = fetch_all()
  
-    if args.merge:
-        data = merge_with_existing(scraped, args.output)
-    else:
-        data = scraped
+    data = merge_with_existing(fetched, args.output) if args.merge else fetched
  
     save(data, args.output)
  
